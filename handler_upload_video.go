@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -15,6 +19,70 @@ import (
 )
 
 const GIGABYTE int = 1 << 30
+const SIXTEEN_TO_NINE float64 = 16.0 / 9.0
+const NINE_TO_SIXTEEN float64 = 9.0 / 16.0
+const EPSILON float64 = 0.01
+
+type aspectRatio string
+
+const (
+	aspectRatioInvalid       aspectRatio = ""
+	aspectRatioSixteenToNine aspectRatio = "16:9"
+	aspectRatioNineToSixteen aspectRatio = "9:16"
+	aspectRatioOther         aspectRatio = "other"
+)
+
+func absCompare(a, b float64) bool {
+	if a > b {
+		return a-b < EPSILON
+	}
+	return b-a < EPSILON
+}
+
+func getVideoAspectRatio(filePath string) (aspectRatio, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	var buffer bytes.Buffer
+	cmd.Stdout = &buffer
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	var result struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"streams"`
+	}
+
+	if err := json.Unmarshal(buffer.Bytes(), &result); err != nil {
+		return "", err
+	}
+
+	prettyJSON, _ := json.MarshalIndent(result, "", "  ")
+	log.Printf("result: %s", string(prettyJSON))
+
+	if len(result.Streams) == 0 {
+		return "", fmt.Errorf("no streams found in video file")
+	}
+	width := result.Streams[0].Width
+	height := result.Streams[0].Height
+	log.Printf("Width: %d, Height: %d", width, height)
+
+	if width == 0 || height == 0 {
+		return "", fmt.Errorf("invalid video dimensions: %dx%d", width, height)
+	}
+
+	ratio := float64(width) / float64(height)
+	if absCompare(ratio, SIXTEEN_TO_NINE) {
+		return aspectRatioSixteenToNine, nil
+	} else if absCompare(ratio, NINE_TO_SIXTEEN) {
+		return aspectRatioNineToSixteen, nil
+	} else {
+		return aspectRatioOther, nil
+	}
+}
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, int64(GIGABYTE))
@@ -77,9 +145,28 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Unable to get video aspect ratio", err)
+		return
+	}
+
+	var prefix string
+	switch aspectRatio {
+	case aspectRatioSixteenToNine:
+		prefix = "landscape"
+	case aspectRatioNineToSixteen:
+		prefix = "portrait"
+	case aspectRatioOther:
+		prefix = "other"
+	default:
+		respondWithError(w, http.StatusInternalServerError, "Invalid aspect ratio", fmt.Errorf("invalid aspect ratio: %s", aspectRatio))
+		return
+	}
+
 	randomBytes := make([]byte, 32)
 	_, _ = rand.Read(randomBytes)
-	key := fmt.Sprintf("%s.mp4", base64.RawURLEncoding.EncodeToString(randomBytes))
+	key := fmt.Sprintf("%s/%s.mp4", prefix, base64.RawURLEncoding.EncodeToString(randomBytes))
 
 	params := s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
